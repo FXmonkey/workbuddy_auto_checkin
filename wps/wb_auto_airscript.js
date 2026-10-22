@@ -11,7 +11,7 @@
  *   B1 = WB_ACCESS_TOKEN  （必填，由本机 refresh_token.py 导出，约 28 天更新一次）
  *   B2 = FEISHU_WEBHOOK   （选填，飞书群自定义机器人地址）
  *   B3 = WB_ENDPOINT      （选填，留空即默认 https://copilot.tencent.com）
- *   B5/B6/B7/B8 = 运行后自动回写：签到结论 / 猫猫结论 / 整体 / 上次运行时间
+ *   B5/B6/B7/B8/B9 = 运行后自动回写：签到结论 / 猫猫结论 / 整体 / 上次运行时间 / 飞书推送
  *
  * 使用前提：脚本编辑器「服务」中已添加「网络 API」。
  * 兼容性：同时兼容 AirScript 2.0（ET JSAPI：Value 是方法、Value2 可写、
@@ -328,6 +328,7 @@ function runBuddy(headers, endpoint) {
 
 // ---------------------------------------------------------------- 飞书
 
+/** 推送到飞书自定义机器人。返回 {ok, reason}，失败原因可供表格回写展示。 */
 function pushFeishu(webhook, title, checkinLine, buddyLine, overallOk) {
   var color = overallOk ? "green" : "red";
   var lines = [
@@ -360,10 +361,17 @@ function pushFeishu(webhook, title, checkinLine, buddyLine, overallOk) {
     var body = {};
     try { body = resp.json(); } catch (e) { body = {}; }
     log("  [飞书] HTTP " + resp.status + " " + JSON.stringify(body));
-    return body.code === 0;
+    if (resp.status >= 300) {
+      return { ok: false, reason: "HTTP " + resp.status };
+    }
+    if (body.code === 0) {
+      return { ok: true };
+    }
+    // 常见：19001 = webhook 地址无效或复制不完整；签名校验开启 = 缺 sign
+    return { ok: false, reason: "飞书返回码 " + (body.code === undefined ? "未知" : body.code) +
+                             "，19001 多为地址不对，开启过签名校验也会失败" };
   } catch (e) {
-    log("  [飞书] 推送失败：" + String(e));
-    return false;
+    return { ok: false, reason: String(e).slice(0, 120) };
   }
 }
 
@@ -467,7 +475,8 @@ function writeCell(addr, value) {
 function ensureLabels() {
   var labels = {
     A1: "WB_ACCESS_TOKEN", A2: "FEISHU_WEBHOOK", A3: "WB_ENDPOINT",
-    A5: "签到结论", A6: "猫猫结论", A7: "整体", A8: "上次运行时间"
+    A5: "签到结论", A6: "猫猫结论", A7: "整体", A8: "上次运行时间",
+    A9: "飞书推送"
   };
   for (var addr in labels) {
     if (Object.prototype.hasOwnProperty.call(labels, addr) && readCell(addr) === "") {
@@ -540,10 +549,15 @@ function main() {
   var checkinLine = (checkinOk ? "✅ " : "❌ ") + checkin.report;
   var buddyLine = buddy.report ? "🐱 " + buddy.report : "🐱 无结论";
 
+  // 推送结果也回写表格：业务结论（B5-B7）与推送状态（B9）分开，
+  // 避免「表格显示成功但飞书没消息」时无从排查
+  var pushLine;
   if (webhook) {
-    pushFeishu(webhook, "每日自动化", checkinLine, buddyLine, overallOk);
+    var pr = pushFeishu(webhook, "每日自动化", checkinLine, buddyLine, overallOk);
+    pushLine = pr.ok ? "✅ 已推送到飞书" : "❌ 推送失败：" + pr.reason;
   } else {
     log("  （B2 未填飞书 webhook，跳过推送）");
+    pushLine = "未配置：B2 没填飞书地址，本次不推送";
   }
 
   // 结果回写表格
@@ -551,6 +565,7 @@ function main() {
   writeCell("B6", buddyLine);
   writeCell("B7", overallOk ? "成功（签到已达成）" : "失败（签到未达成）");
   writeCell("B8", nowBeijing());
+  writeCell("B9", pushLine);
 
   log("=== 完成：" + (overallOk ? "成功" : "失败") + " ===");
   log("  签到：" + checkinLine);
