@@ -328,7 +328,13 @@ function runBuddy(headers, endpoint) {
 
 // ---------------------------------------------------------------- 飞书
 
-/** 推送到飞书自定义机器人。返回 {ok, reason}，失败原因可供表格回写展示。 */
+/** 推送到飞书自定义机器人。返回 {ok, reason}。
+ *
+ * 重试策略与业务请求对齐：
+ *   - 网络异常 / HTTP 5xx → 自动重试（最多 MAX_RETRY 次，退避），这类失败重试有用
+ *   - 飞书业务拒绝（地址无效 19001、签名校验开启等）→ 不重试，重试也无用，原因写进 B9
+ * 全部失败后，下一次定时运行会再推一遍当天结果（脚本幂等），相当于天然兜底。
+ */
 function pushFeishu(webhook, title, checkinLine, buddyLine, overallOk) {
   var color = overallOk ? "green" : "red";
   var lines = [
@@ -351,27 +357,48 @@ function pushFeishu(webhook, title, checkinLine, buddyLine, overallOk) {
       elements: [{ tag: "div", text: { tag: "lark_md", content: lines.join("\n") } }]
     }
   };
-  try {
-    var resp = HTTP.fetch(webhook, {
-      method: "POST",
-      timeout: 15000,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    var body = {};
-    try { body = resp.json(); } catch (e) { body = {}; }
-    log("  [飞书] HTTP " + resp.status + " " + JSON.stringify(body));
-    if (resp.status >= 300) {
-      return { ok: false, reason: "HTTP " + resp.status };
+  var attempt = 0;
+  while (true) {
+    attempt++;
+    try {
+      var resp = HTTP.fetch(webhook, {
+        method: "POST",
+        timeout: 15000,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      var body = {};
+      try { body = resp.json(); } catch (e) { body = {}; }
+      log("  [飞书] 第" + attempt + "次 HTTP " + resp.status + " " + JSON.stringify(body));
+      // 5xx 属瞬时故障，退避重试
+      if (resp.status >= 500) {
+        if (attempt < MAX_RETRY) {
+          Time.sleep(2000 * attempt);
+          continue;
+        }
+        return { ok: false, reason: "重试 " + MAX_RETRY + " 次后仍 HTTP " + resp.status };
+      }
+      if (resp.status >= 300) {
+        return { ok: false, reason: "HTTP " + resp.status };
+      }
+      if (body.code === 0) {
+        return { ok: true };
+      }
+      // 常见：19001 = webhook 地址无效或复制不完整；开启签名校验也会被拒。
+      // 这类是配置问题，重试无用，直接带原因返回，由 B9 提示用户改配置。
+      return { ok: false,
+               reason: "飞书返回码 " + (body.code === undefined ? "未知" : body.code) +
+                       "（19001 多为地址不对；机器人若开了签名校验也会失败。这是配置问题，"
+                       + "重试无用：检查 B2 地址，或建机器人时不勾选签名校验）" };
+    } catch (e) {
+      // 网络异常：退避重试
+      if (attempt < MAX_RETRY) {
+        log("  [飞书] 请求异常，退避后重试（" + attempt + "/" + MAX_RETRY + "）：" + String(e));
+        Time.sleep(2000 * attempt);
+        continue;
+      }
+      return { ok: false, reason: "重试 " + MAX_RETRY + " 次后仍异常：" + String(e).slice(0, 100) };
     }
-    if (body.code === 0) {
-      return { ok: true };
-    }
-    // 常见：19001 = webhook 地址无效或复制不完整；签名校验开启 = 缺 sign
-    return { ok: false, reason: "飞书返回码 " + (body.code === undefined ? "未知" : body.code) +
-                             "，19001 多为地址不对，开启过签名校验也会失败" };
-  } catch (e) {
-    return { ok: false, reason: String(e).slice(0, 120) };
   }
 }
 
@@ -550,7 +577,9 @@ function main() {
   var buddyLine = buddy.report ? "🐱 " + buddy.report : "🐱 无结论";
 
   // 推送结果也回写表格：业务结论（B5-B7）与推送状态（B9）分开，
-  // 避免「表格显示成功但飞书没消息」时无从排查
+  // 避免「表格显示成功但飞书没消息」时无从排查。
+  // 推送失败的兜底：瞬时故障已自动重试；配置类失败改好 B2 后手动跑一次即可；
+  // 若当天建了多个定时时间点，下一次运行会自动再推一遍当天结果。
   var pushLine;
   if (webhook) {
     var pr = pushFeishu(webhook, "每日自动化", checkinLine, buddyLine, overallOk);
