@@ -172,6 +172,18 @@ python refresh_token.py
 
 凭据文件按 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info` 探测；客户端按 `WORKBUDDY_EXE` → `%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe` → 常见盘根目录 → 注册表 `DisplayIcon` 的顺序探测。
 
+### 解密助手的超时策略
+
+导出 token 时要把登录态交给客户端自己解密，这一步要拉起 Electron 并走完冷启动。
+客户端体积与系统负载都会影响冷启动耗时（实测可达 50~80 秒），因此脚本不采用
+「等固定 30 秒就判失败」的做法：
+
+- 首轮等待 45 秒；超时后**不杀进程**，改为继续等同一个进程，每轮把等待上限翻倍
+- 总时限 240 秒，用尽仍未返回才判定失败并终止进程
+- 之所以不杀进程重来：冷启动的代价已经付过，重启等于重新付一次
+
+如需调整，改 `refresh_token.py` 顶部的 `AUTH_TIMEOUT`（总时限）、`AUTH_TIMEOUT_SLICE`（首轮等待）与 `AUTH_TIMEOUT_STEP`（每轮倍数）。
+
 ## 行为矩阵
 
 | 情况 | 行为 | `result` |
@@ -251,6 +263,8 @@ wps/                          WPS 金山文档版（脚本 + 说明，见 wps/RE
 **偶发 302** — 高频轮询旅行状态时网关会短暂跳转，请求层已对 3xx 退避重试。按日频执行不会触发。
 
 **非默认安装路径** — 用 `WORKBUDDY_EXE` 指定客户端，用 `WORKBUDDY_AUTH_FILE` 指定凭据文件。
+
+**提示「解密助手超时」** — 客户端冷启动太慢，240 秒总时限内没能完成解密。先确认客户端正在运行（冷启动会更快），再重试；仍失败可在 `refresh_token.py` 顶部调大 `AUTH_TIMEOUT`。日志里每轮等待都会打印「解密助手仍在启动，继续等待…」，可据此判断是变慢还是真失败。
 
 ## 已知限制
 

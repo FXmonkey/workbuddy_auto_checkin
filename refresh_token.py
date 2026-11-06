@@ -24,8 +24,15 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
-AUTH_TIMEOUT = 30.0
+# 助手调用的总时限（秒）。客户端体积与系统负载会让 Electron 冷启动变慢，
+# 实测冷启动可到 50~80 秒，因此不再用「30 秒一刀切」判定失败。
+AUTH_TIMEOUT = 240.0
+# 首次等待的片长（秒）：超时后不杀进程，按倍数延长等待同一进程。
+# 冷启动的代价已经付过，重启反而要重新付一次，所以宁可继续等。
+AUTH_TIMEOUT_SLICE = 45.0
+AUTH_TIMEOUT_STEP = 2.0
 INPUT_LIMIT = 65536
 OUTPUT_LIMIT = 65536
 TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/-]+=*")
@@ -217,7 +224,12 @@ def _registry_runtime():
 
 
 def run_helper(exe, request):
-    """所有管道与超时都有界；异常中绝不含捕获的数据。"""
+    """所有管道与超时都有界；异常中绝不含捕获的数据。
+
+    超时策略：不因一次等待超时就杀掉助手进程。Electron 冷启动可能要几十秒，
+    杀掉重启等于把已经付过的冷启动代价重来一遍。因此首轮超时后改为
+    「继续等同一个进程、每轮把等待上限翻倍」，直到用满总时限 AUTH_TIMEOUT。
+    """
     data = json.dumps(dict(request, version=1), ensure_ascii=True).encode("ascii")
     env = {k: v for k, v in os.environ.items()
            if not k.upper().startswith(("NODE_", "ELECTRON_", "WORKBUDDY_"))}
@@ -228,12 +240,28 @@ def run_helper(exe, request):
         env=env, shell=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    try:
-        out, err = proc.communicate(data, timeout=AUTH_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        raise SystemExit("解密助手超时")
+    deadline = time.monotonic() + AUTH_TIMEOUT
+    wait = min(AUTH_TIMEOUT_SLICE, AUTH_TIMEOUT)
+    sent = False
+    while True:
+        try:
+            if sent:
+                # 已写过 stdin，续读时必须传 None，否则 communicate 会拒绝重发。
+                out, err = proc.communicate(timeout=wait)
+            else:
+                # 先置位再调用：即使这一轮超时抛异常，下一轮也只能续读、不能重发。
+                sent = True
+                out, err = proc.communicate(data, timeout=wait)
+            break
+        except subprocess.TimeoutExpired:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                proc.communicate()
+                raise SystemExit("解密助手超时")
+            # 进程还在跑，继续等它；每轮等待上限翻倍，但不超过剩余总时限。
+            wait = max(min(wait * AUTH_TIMEOUT_STEP, remaining), 0.5)
+            sys.stderr.write("解密助手仍在启动，继续等待（总时限剩余 %.0f 秒）…\n" % remaining)
     if len(out) > OUTPUT_LIMIT:
         raise SystemExit("解密助手输出超限")
     try:
