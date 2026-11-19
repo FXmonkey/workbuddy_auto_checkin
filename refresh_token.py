@@ -316,8 +316,10 @@ def main():
     # 保证无论是终端跑 .py 还是双击 exe，输出结构一致、都能照着做
     if gh_repo and shutil.which("gh") is not None:
         # 明文 token 只作为 stdin 传给 gh，不出现在命令行与进程列表中
+        # gh secret set 不带 --body 时才从 stdin 读取；传 "--body -" 会把
+        # 字面量 "-" 写进 Secret（gh 2.100.0 实测），导致云端 401。
         proc = subprocess.run(
-            ["gh", "secret", "set", "WB_ACCESS_TOKEN", "--repo", gh_repo, "--body", "-"],
+            ["gh", "secret", "set", "WB_ACCESS_TOKEN", "--repo", gh_repo],
             input=token.encode("utf-8"),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
